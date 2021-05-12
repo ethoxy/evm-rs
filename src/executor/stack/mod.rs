@@ -184,16 +184,21 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 			Err(e) => return e.into(),
 		}
 
-		match self.create_inner(
+		match self.create_prepare(
 			caller,
 			CreateScheme::Legacy { caller },
 			value,
-			init_code,
 			Some(gas_limit),
-			false,
+			false
 		) {
-			Capture::Exit((s, _, _)) => s,
-			Capture::Trap(_) => unreachable!(),
+			Ok((context, address)) => {
+				let (reason, return_value) = self.create_execute(address, init_code, context);
+				match self.create_capture(address, reason, return_value) {
+					Capture::Exit((s, _, _)) => s,
+					Capture::Trap(_) => unreachable!(),
+				}
+			},
+			Err(e) => return e.into()
 		}
 	}
 
@@ -213,16 +218,21 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 		}
 		let code_hash = H256::from_slice(Keccak256::digest(&init_code).as_slice());
 
-		match self.create_inner(
+		match self.create_prepare(
 			caller,
 			CreateScheme::Create2 { caller, code_hash, salt },
 			value,
-			init_code,
 			Some(gas_limit),
-			false,
+			false
 		) {
-			Capture::Exit((s, _, _)) => s,
-			Capture::Trap(_) => unreachable!(),
+			Ok((context, address)) => {
+				let (reason, return_value) = self.create_execute(address, init_code, context);
+				match self.create_capture(address, reason, return_value) {
+					Capture::Exit((s, _, _)) => s,
+					Capture::Trap(_) => unreachable!(),
+				}
+			},
+			Err(e) => return e.into()
 		}
 	}
 
@@ -249,13 +259,25 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 			apparent_value: value,
 		};
 
-		match self.call_inner(address, Some(Transfer {
-			source: caller,
-			target: address,
-			value
-		}), data, Some(gas_limit), false, false, false, context) {
-			Capture::Exit((s, v)) => (s, v),
-			Capture::Trap(_) => unreachable!(),
+		match self.call_prepare(
+			address, Some(Transfer {
+				source: caller,
+				target: address,
+				value
+			}), &data, Some(gas_limit), false, false, false, &context
+		) {
+			// Precompile
+			Ok((Some(reason), return_value)) => (reason, return_value),
+			// Call type
+			Ok((None, code)) => {
+				let (reason, return_value) = self.call_execute(code, data, context);
+				match self.call_capture(reason, return_value) {
+					Capture::Exit((s, v)) => (s, v),
+					Capture::Trap(_) => unreachable!(),
+				}
+			},
+			// Error
+			Err(e) => return (e.into(), Vec::new())
 		}
 	}
 
@@ -306,20 +328,19 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 		}
 	}
 
-	fn create_inner(
+	pub fn create_prepare(
 		&mut self,
 		caller: H160,
 		scheme: CreateScheme,
 		value: U256,
-		init_code: Vec<u8>,
 		target_gas: Option<u64>,
 		take_l64: bool,
-	) -> Capture<(ExitReason, Option<H160>, Vec<u8>), Infallible> {
+	) -> Result<(Context, H160), ExitError> {
 		macro_rules! try_or_fail {
 			( $e:expr ) => {
 				match $e {
 					Ok(v) => v,
-					Err(e) => return Capture::Exit((e.into(), None, Vec::new())),
+					Err(e) => return Err(e),
 				}
 			}
 		}
@@ -330,12 +351,12 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 
 		if let Some(depth) = self.state.metadata().depth {
 			if depth > self.config.call_stack_limit {
-				return Capture::Exit((ExitError::CallTooDeep.into(), None, Vec::new()))
+				return Err(ExitError::CallTooDeep)
 			}
 		}
 
 		if self.balance(caller) < value {
-			return Capture::Exit((ExitError::OutOfFund.into(), None, Vec::new()))
+			return Err(ExitError::OutOfFund)
 		}
 
 		let after_gas = if take_l64 && self.config.call_l64_after_gas {
@@ -366,12 +387,12 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 		{
 			if self.code_size(address) != U256::zero() {
 				let _ = self.exit_substate(StackExitKind::Failed);
-				return Capture::Exit((ExitError::CreateCollision.into(), None, Vec::new()))
+				return Err(ExitError::CreateCollision)
 			}
 
 			if self.nonce(address) > U256::zero() {
 				let _ = self.exit_substate(StackExitKind::Failed);
-				return Capture::Exit((ExitError::CreateCollision.into(), None, Vec::new()))
+				return Err(ExitError::CreateCollision)
 			}
 
 			self.state.reset_storage(address);
@@ -391,7 +412,7 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 			Ok(()) => (),
 			Err(e) => {
 				let _ = self.exit_substate(StackExitKind::Reverted);
-				return Capture::Exit((ExitReason::Error(e), None, Vec::new()))
+				return Err(e)
 			},
 		}
 
@@ -399,33 +420,51 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 			self.state.inc_nonce(address);
 		}
 
+		Ok((context, address))
+	}
+
+	fn create_execute(
+		&mut self,
+		address: H160,
+		init_code: Vec<u8>,
+		context: Context,
+	) -> (ExitReason, Vec<u8>) {
 		let mut runtime = Runtime::new(
 			Rc::new(init_code),
 			Rc::new(Vec::new()),
 			context,
 			self.config,
 		);
-
 		let reason = self.execute(&mut runtime);
 		log::debug!(target: "evm", "Create execution using address {}: {:?}", address, reason);
+		(reason, runtime.machine().return_value())
+	}
 
+	pub fn create_capture(
+		&mut self,
+		address: H160,
+		reason: ExitReason,
+		return_value: Vec<u8>
+	) -> Capture<(ExitReason, Option<H160>, Vec<u8>), Infallible> {
 		match reason {
 			ExitReason::Succeed(s) => {
-				let out = runtime.machine().return_value();
-
+				
 				if let Some(limit) = self.config.create_contract_limit {
-					if out.len() > limit {
+					if return_value.len() > limit {
 						self.state.metadata_mut().gasometer.fail();
 						let _ = self.exit_substate(StackExitKind::Failed);
 						return Capture::Exit((ExitError::CreateContractLimit.into(), None, Vec::new()))
 					}
 				}
 
-				match self.state.metadata_mut().gasometer.record_deposit(out.len()) {
+				match self.state.metadata_mut().gasometer.record_deposit(return_value.len()) {
 					Ok(()) => {
 						let e = self.exit_substate(StackExitKind::Succeeded);
-						self.state.set_code(address, out);
-						try_or_fail!(e);
+						self.state.set_code(address, return_value);
+						match e {
+							Ok(v) => v,
+							Err(e) => return Capture::Exit((e.into(), None, Vec::new())),
+						}
 						Capture::Exit((ExitReason::Succeed(s), Some(address), Vec::new()))
 					},
 					Err(e) => {
@@ -441,7 +480,7 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 			},
 			ExitReason::Revert(e) => {
 				let _ = self.exit_substate(StackExitKind::Reverted);
-				Capture::Exit((ExitReason::Revert(e), None, runtime.machine().return_value()))
+				Capture::Exit((ExitReason::Revert(e), None, return_value))
 			},
 			ExitReason::Fatal(e) => {
 				self.state.metadata_mut().gasometer.fail();
@@ -451,22 +490,22 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 		}
 	}
 
-	fn call_inner(
+	pub fn call_prepare(
 		&mut self,
 		code_address: H160,
 		transfer: Option<Transfer>,
-		input: Vec<u8>,
+		input: &Vec<u8>,
 		target_gas: Option<u64>,
 		is_static: bool,
 		take_l64: bool,
 		take_stipend: bool,
-		context: Context,
-	) -> Capture<(ExitReason, Vec<u8>), Infallible> {
+		context: &Context,
+	) -> Result<(Option<ExitReason>, Vec<u8>), ExitError> {
 		macro_rules! try_or_fail {
 			( $e:expr ) => {
 				match $e {
 					Ok(v) => v,
-					Err(e) => return Capture::Exit((e.into(), Vec::new())),
+					Err(e) => return Err(e),
 				}
 			}
 		}
@@ -509,7 +548,7 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 		if let Some(depth) = self.state.metadata().depth {
 			if depth > self.config.call_stack_limit {
 				let _ = self.exit_substate(StackExitKind::Reverted);
-				return Capture::Exit((ExitError::CallTooDeep.into(), Vec::new()))
+				return Err(ExitError::CallTooDeep)
 			}
 		}
 
@@ -518,7 +557,7 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 				Ok(()) => (),
 				Err(e) => {
 					let _ = self.exit_substate(StackExitKind::Reverted);
-					return Capture::Exit((ExitReason::Error(e), Vec::new()))
+					return Err(e)
 				},
 			}
 		}
@@ -528,15 +567,24 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 				Ok((s, out, cost)) => {
 					let _ = self.state.metadata_mut().gasometer.record_cost(cost);
 					let _ = self.exit_substate(StackExitKind::Succeeded);
-					Capture::Exit((ExitReason::Succeed(s), out))
+					Ok((Some(ExitReason::Succeed(s)), out))
 				},
 				Err(e) => {
 					let _ = self.exit_substate(StackExitKind::Failed);
-					Capture::Exit((ExitReason::Error(e), Vec::new()))
+					Err(e)
 				},
 			}
 		}
 
+		Ok((None, code))
+	}
+
+	fn call_execute(
+		&mut self,
+		code: Vec<u8>,
+		input: Vec<u8>,
+		context: Context
+	) -> (ExitReason, Vec<u8>) {
 		let mut runtime = Runtime::new(
 			Rc::new(code),
 			Rc::new(input),
@@ -545,12 +593,18 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 		);
 
 		let reason = self.execute(&mut runtime);
-		log::debug!(target: "evm", "Call execution using address {}: {:?}", code_address, reason);
+		(reason, runtime.machine().return_value())
+	}
 
+	pub fn call_capture(
+		&mut self,
+		reason: ExitReason,
+		return_value: Vec<u8>
+	) -> Capture<(ExitReason, Vec<u8>), Infallible> {
 		match reason {
 			ExitReason::Succeed(s) => {
 				let _ = self.exit_substate(StackExitKind::Succeeded);
-				Capture::Exit((ExitReason::Succeed(s), runtime.machine().return_value()))
+				Capture::Exit((ExitReason::Succeed(s), return_value))
 			},
 			ExitReason::Error(e) => {
 				let _ = self.exit_substate(StackExitKind::Failed);
@@ -558,7 +612,7 @@ impl<'config, S: StackState<'config>> StackExecutor<'config, S> {
 			},
 			ExitReason::Revert(e) => {
 				let _ = self.exit_substate(StackExitKind::Reverted);
-				Capture::Exit((ExitReason::Revert(e), runtime.machine().return_value()))
+				Capture::Exit((ExitReason::Revert(e), return_value))
 			},
 			ExitReason::Fatal(e) => {
 				self.state.metadata_mut().gasometer.fail();
@@ -661,7 +715,13 @@ impl<'config, S: StackState<'config>> Handler for StackExecutor<'config, S> {
 		init_code: Vec<u8>,
 		target_gas: Option<u64>,
 	) -> Capture<(ExitReason, Option<H160>, Vec<u8>), Self::CreateInterrupt> {
-		self.create_inner(caller, scheme, value, init_code, target_gas, true)
+		match self.create_prepare(caller, scheme, value, target_gas, true) {
+			Ok((context, address)) => {
+				let (reason, return_value) = self.create_execute(address, init_code, context);
+				return self.create_capture(address, reason, return_value);
+			},
+			Err(e) => return Capture::Exit((e.into(), None, Vec::new()))
+		}
 	}
 
 	fn call(
@@ -673,7 +733,17 @@ impl<'config, S: StackState<'config>> Handler for StackExecutor<'config, S> {
 		is_static: bool,
 		context: Context,
 	) -> Capture<(ExitReason, Vec<u8>), Self::CallInterrupt> {
-		self.call_inner(code_address, transfer, input, target_gas, is_static, true, true, context)
+		match self.call_prepare(code_address, transfer, &input, target_gas, is_static, true, true, &context) {
+			// Precompile
+			Ok((Some(reason), return_value)) => Capture::Exit((reason, return_value)),
+			// Call type
+			Ok((None, code)) => {
+				let (reason, return_value) = self.call_execute(code, input, context);
+				return self.call_capture(reason, return_value);
+			},
+			// Error
+			Err(e) => return Capture::Exit((e.into(), Vec::new()))
+		}
 	}
 
 	#[inline]
