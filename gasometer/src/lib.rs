@@ -5,6 +5,8 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
 #[cfg(feature = "tracing")]
 pub mod tracing;
 
@@ -26,6 +28,9 @@ mod costs;
 mod memory;
 mod utils;
 
+use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 use core::cmp::max;
 use primitive_types::{H160, H256, U256};
 use evm_core::{Opcode, ExitError, Stack};
@@ -62,6 +67,12 @@ pub struct Gasometer<'config> {
 impl<'config> Gasometer<'config> {
 	/// Create a new gasometer with given gas limit and config.
 	pub fn new(gas_limit: u64, config: &'config Config) -> Self {
+		let (accessed_addresses, accessed_storage_keys) = if config.increase_state_access_gas {
+			(Some(BTreeSet::new()), Some(BTreeSet::new()))
+		} else {
+			(None, None)
+		};
+
 		Self {
 			gas_limit,
 			config,
@@ -70,18 +81,53 @@ impl<'config> Gasometer<'config> {
 				used_gas: 0,
 				refunded_gas: 0,
 				config,
+				accessed_addresses,
+				accessed_storage_keys,
+				parent: None,
 			}),
 		}
+	}
+
+	pub fn spawn(self, gas_limit: u64) -> Self {
+		let (accessed_addresses, accessed_storage_keys) = if self.config.increase_state_access_gas {
+			(Some(BTreeSet::new()), Some(BTreeSet::new()))
+		} else {
+			(None, None)
+		};
+		let config = self.config;
+
+
+		Self {
+			gas_limit,
+			config,
+			inner: Ok(Inner {
+				memory_gas: 0,
+				used_gas: 0,
+				refunded_gas: 0,
+				config,
+				accessed_addresses,
+				accessed_storage_keys,
+				parent: self.inner.ok().map(Box::new),
+			})
+		}
+	}
+
+	pub fn get_accessed_addresses(&self) -> Option<alloc::collections::btree_set::Iter<'_, H160>> {
+		self.inner.as_ref().ok().and_then(|inner| inner.accessed_addresses.as_ref()).map(|set| set.iter())
+	}
+
+	pub fn get_accessed_storages(&self) -> Option<alloc::collections::btree_set::Iter<'_, (H160, H256)>> {
+		self.inner.as_ref().ok().and_then(|inner| inner.accessed_storage_keys.as_ref()).map(|set| set.iter())
 	}
 
 	#[inline]
 	/// Returns the numerical gas cost value.
 	pub fn gas_cost(
-		&self,
+		&mut self,
 		cost: GasCost,
 		gas: u64,
 	) -> Result<u64, ExitError>  {
-		match self.inner.as_ref() {
+		match self.inner.as_mut() {
 			Ok(inner) => inner.gas_cost(cost, gas),
 			Err(e) => Err(e.clone())
 		}
@@ -233,21 +279,60 @@ impl<'config> Gasometer<'config> {
 		Ok(())
 	}
 
+	/// Access an address (makes certain gas costs cheaper in the future)
+	pub fn access_address(&mut self, address: H160) -> Result<(), ExitError> {
+		let inner = self.inner_mut()?;
+		if let Some(accessed_addresses) = &mut inner.accessed_addresses {
+			accessed_addresses.insert(address);
+		}
+		Ok(())
+	}
+
+	pub fn access_addresses<I>(&mut self, addresses: I) -> Result<(), ExitError>
+	where
+		I: Iterator<Item=H160>
+	{
+		let inner = self.inner_mut()?;
+		if let Some(accessed_addresses) = &mut inner.accessed_addresses {
+			for address in addresses {
+				accessed_addresses.insert(address);
+			}
+		}
+		Ok(())
+	}
+
+	pub fn access_storages<I>(&mut self, iter: I) -> Result<(), ExitError>
+	where
+		I: Iterator<Item=(H160, H256)>
+	{
+		let inner = self.inner_mut()?;
+        if let Some(accessed_storage_keys) = &mut inner.accessed_storage_keys {
+			for (address, key) in iter {
+				accessed_storage_keys.insert((address, key));
+			}
+		}
+		Ok(())
+	}
+
 	/// Record transaction cost.
 	pub fn record_transaction(
 		&mut self,
 		cost: TransactionCost,
 	) -> Result<(), ExitError> {
 		let gas_cost = match cost {
-			TransactionCost::Call { zero_data_len, non_zero_data_len } => {
+			TransactionCost::Call { zero_data_len, non_zero_data_len, access_list_address_len, access_list_storage_len } => {
 				self.config.gas_transaction_call +
 					zero_data_len as u64 * self.config.gas_transaction_zero_data +
-					non_zero_data_len as u64 * self.config.gas_transaction_non_zero_data
+					non_zero_data_len as u64 * self.config.gas_transaction_non_zero_data +
+					access_list_address_len as u64 * self.config.gas_access_list_address +
+					access_list_storage_len as u64 * self.config.gas_access_list_storage_key
 			},
-			TransactionCost::Create { zero_data_len, non_zero_data_len } => {
+			TransactionCost::Create { zero_data_len, non_zero_data_len, access_list_address_len, access_list_storage_len } => {
 				self.config.gas_transaction_create +
 					zero_data_len as u64 * self.config.gas_transaction_zero_data +
-					non_zero_data_len as u64 * self.config.gas_transaction_non_zero_data
+					non_zero_data_len as u64 * self.config.gas_transaction_non_zero_data +
+					access_list_address_len as u64 * self.config.gas_access_list_address +
+					access_list_storage_len as u64 * self.config.gas_access_list_storage_key
 			},
 		};
 
@@ -278,22 +363,34 @@ impl<'config> Gasometer<'config> {
 
 /// Calculate the call transaction cost.
 pub fn call_transaction_cost(
-	data: &[u8]
+	data: &[u8],
+	access_list: &[(H160, Vec<H256>)],
 ) -> TransactionCost {
 	let zero_data_len = data.iter().filter(|v| **v == 0).count();
 	let non_zero_data_len = data.len() - zero_data_len;
+	let (access_list_address_len, access_list_storage_len) = count_access_list(access_list);
 
-	TransactionCost::Call { zero_data_len, non_zero_data_len }
+	TransactionCost::Call { zero_data_len, non_zero_data_len, access_list_address_len, access_list_storage_len }
 }
 
 /// Calculate the create transaction cost.
 pub fn create_transaction_cost(
-	data: &[u8]
+	data: &[u8],
+	access_list: &[(H160, Vec<H256>)],
 ) -> TransactionCost {
 	let zero_data_len = data.iter().filter(|v| **v == 0).count();
 	let non_zero_data_len = data.len() - zero_data_len;
+	let (access_list_address_len, access_list_storage_len) = count_access_list(access_list);
 
-	TransactionCost::Create { zero_data_len, non_zero_data_len }
+	TransactionCost::Create { zero_data_len, non_zero_data_len, access_list_address_len, access_list_storage_len }
+}
+
+/// Counts the number of addresses and storage keys in the access list
+fn count_access_list(access_list: &[(H160, Vec<H256>)]) -> (usize, usize) {
+	let access_list_address_len = access_list.len();
+	let access_list_storage_len = access_list.iter().map(|(_, keys)| keys.len()).sum();
+
+	(access_list_address_len, access_list_storage_len)
 }
 
 #[inline]
@@ -448,26 +545,41 @@ pub fn dynamic_opcode_cost<H: Handler>(
 		Opcode::SELFBALANCE if config.has_self_balance => GasCost::Low,
 		Opcode::SELFBALANCE => GasCost::Invalid,
 
-		Opcode::EXTCODESIZE => GasCost::ExtCodeSize,
-		Opcode::BALANCE => GasCost::Balance,
+		Opcode::EXTCODESIZE => GasCost::ExtCodeSize {
+			address: stack.peek(0)?.into(),
+		},
+		Opcode::BALANCE => GasCost::Balance {
+			address: stack.peek(0)?.into(),
+		},
 		Opcode::BLOCKHASH => GasCost::BlockHash,
 
-		Opcode::EXTCODEHASH if config.has_ext_code_hash => GasCost::ExtCodeHash,
+		Opcode::EXTCODEHASH if config.has_ext_code_hash => GasCost::ExtCodeHash {
+			address: stack.peek(0)?.into(),
+		},
 		Opcode::EXTCODEHASH => GasCost::Invalid,
 
-		Opcode::CALLCODE => GasCost::CallCode {
-			value: U256::from_big_endian(&stack.peek(2)?[..]),
-			gas: U256::from_big_endian(&stack.peek(0)?[..]),
-			target_exists: handler.exists(stack.peek(1)?.into()),
-		},
-		Opcode::STATICCALL => GasCost::StaticCall {
-			gas: U256::from_big_endian(&stack.peek(0)?[..]),
-			target_exists: handler.exists(stack.peek(1)?.into()),
-		},
+		Opcode::CALLCODE => {
+			let target = stack.peek(1)?.into();
+			GasCost::CallCode {
+				value: U256::from_big_endian(&stack.peek(2)?[..]),
+				gas: U256::from_big_endian(&stack.peek(0)?[..]),
+				target,
+				target_exists: handler.exists(target),
+			}
+		}
+		Opcode::STATICCALL => {
+			let target = stack.peek(1)?.into();
+			GasCost::StaticCall {
+				gas: U256::from_big_endian(&stack.peek(0)?[..]),
+				target,
+				target_exists: handler.exists(target),
+			}
+		}
 		Opcode::SHA3 => GasCost::Sha3 {
 			len: U256::from_big_endian(&stack.peek(1)?[..]),
 		},
 		Opcode::EXTCODECOPY => GasCost::ExtCodeCopy {
+			address: stack.peek(0)?.into(),
 			len: U256::from_big_endian(&stack.peek(3)?[..]),
 		},
 		Opcode::CALLDATACOPY | Opcode::CODECOPY => GasCost::VeryLowCopy {
@@ -476,12 +588,19 @@ pub fn dynamic_opcode_cost<H: Handler>(
 		Opcode::EXP => GasCost::Exp {
 			power: U256::from_big_endian(&stack.peek(1)?[..]),
 		},
-		Opcode::SLOAD => GasCost::SLoad,
-
-		Opcode::DELEGATECALL if config.has_delegate_call => GasCost::DelegateCall {
-			gas: U256::from_big_endian(&stack.peek(0)?[..]),
-			target_exists: handler.exists(stack.peek(1)?.into()),
+		Opcode::SLOAD => GasCost::SLoad {
+			address,
+			key: stack.peek(0)?,
 		},
+
+		Opcode::DELEGATECALL if config.has_delegate_call => {
+			let target = stack.peek(1)?.into();
+			GasCost::DelegateCall {
+				gas: U256::from_big_endian(&stack.peek(0)?[..]),
+				target,
+				target_exists: handler.exists(target),
+			}
+		}
 		Opcode::DELEGATECALL => GasCost::Invalid,
 
 		Opcode::RETURNDATASIZE if config.has_return_data => GasCost::Base,
@@ -495,6 +614,8 @@ pub fn dynamic_opcode_cost<H: Handler>(
 			let value = stack.peek(1)?;
 
 			GasCost::SStore {
+				address,
+				key: index,
 				original: handler.original_storage(address, index),
 				current: handler.storage(address, index),
 				new: value,
@@ -524,19 +645,26 @@ pub fn dynamic_opcode_cost<H: Handler>(
 		Opcode::CREATE2 if !is_static && config.has_create2 => GasCost::Create2 {
 			len: U256::from_big_endian(&stack.peek(2)?[..]),
 		},
-		Opcode::SUICIDE if !is_static => GasCost::Suicide {
-			value: handler.balance(address),
-			target_exists: handler.exists(stack.peek(0)?.into()),
-			already_removed: handler.deleted(address),
-		},
+		Opcode::SUICIDE if !is_static => {
+			let target = stack.peek(0)?.into();
+			GasCost::Suicide {
+				value: handler.balance(address),
+				target,
+				target_exists: handler.exists(target),
+				already_removed: handler.deleted(address),
+			}
+		}
 		Opcode::CALL
 			if !is_static ||
-			(is_static && U256::from_big_endian(&stack.peek(2)?[..]) == U256::zero()) =>
+			(is_static && U256::from_big_endian(&stack.peek(2)?[..]) == U256::zero()) => {
+			let target = stack.peek(1)?.into();
 			GasCost::Call {
 				value: U256::from_big_endian(&stack.peek(2)?[..]),
 				gas: U256::from_big_endian(&stack.peek(0)?[..]),
-				target_exists: handler.exists(stack.peek(1)?.into()),
-			},
+				target,
+				target_exists: handler.exists(target),
+			}
+		}
 
 		_ => GasCost::Invalid,
 	};
@@ -605,6 +733,9 @@ struct Inner<'config> {
 	used_gas: u64,
 	refunded_gas: i64,
 	config: &'config Config,
+	accessed_addresses: Option<BTreeSet<H160>>,
+	accessed_storage_keys: Option<BTreeSet<(H160, H256)>>,
+	parent: Option<Box<Inner<'config>>>,
 }
 
 impl<'config> Inner<'config> {
@@ -652,33 +783,34 @@ impl<'config> Inner<'config> {
 
 	/// Returns the gas cost numerical value.
 	fn gas_cost(
-		&self,
+		&mut self,
 		cost: GasCost,
 		gas: u64,
 	) -> Result<u64, ExitError> {
 		Ok(match cost {
-			GasCost::Call { value, target_exists, .. } =>
-				costs::call_cost(value, true, true, !target_exists, self.config),
-			GasCost::CallCode { value, target_exists, .. } =>
-				costs::call_cost(value, true, false, !target_exists, self.config),
-			GasCost::DelegateCall { target_exists, .. } =>
-				costs::call_cost(U256::zero(), false, false, !target_exists, self.config),
-			GasCost::StaticCall { target_exists, .. } =>
-				costs::call_cost(U256::zero(), false, true, !target_exists, self.config),
-			GasCost::Suicide { value, target_exists, .. } =>
-				costs::suicide_cost(value, target_exists, self.config),
+			GasCost::Call { value, target, target_exists, .. } =>
+				costs::call_cost(value, self.check_and_update_address_cold(target), true, true, !target_exists, self.config),
+			GasCost::CallCode { value, target, target_exists, .. } =>
+				costs::call_cost(value, self.check_and_update_address_cold(target), true, false, !target_exists, self.config),
+			GasCost::DelegateCall { target, target_exists, .. } =>
+				costs::call_cost(U256::zero(), self.check_and_update_address_cold(target), false, false, !target_exists, self.config),
+			GasCost::StaticCall { target, target_exists, .. } =>
+				costs::call_cost(U256::zero(), self.check_and_update_address_cold(target), false, true, !target_exists, self.config),
+
+			GasCost::Suicide { value, target, target_exists, .. } =>
+				costs::suicide_cost(value, self.check_and_update_address_cold(target), target_exists, self.config),
 			GasCost::SStore { .. } if self.config.estimate => self.config.gas_sstore_set,
-			GasCost::SStore { original, current, new } =>
-				costs::sstore_cost(original, current, new, gas, self.config)?,
+			GasCost::SStore { address, key, original, current, new } =>
+				costs::sstore_cost(original, current, new, gas, self.check_and_update_storage_cold(address, key), self.config)?,
 
 			GasCost::Sha3 { len } => costs::sha3_cost(len)?,
 			GasCost::Log { n, len } => costs::log_cost(n, len)?,
-			GasCost::ExtCodeCopy { len } => costs::extcodecopy_cost(len, self.config)?,
 			GasCost::VeryLowCopy { len } => costs::verylowcopy_cost(len)?,
 			GasCost::Exp { power } => costs::exp_cost(power, self.config)?,
 			GasCost::Create => consts::G_CREATE,
 			GasCost::Create2 { len } => costs::create2_cost(len)?,
-			GasCost::SLoad => self.config.gas_sload,
+			GasCost::SLoad { address, key } =>
+				costs::sload_cost(self.check_and_update_storage_cold(address, key), self.config),
 
 			GasCost::Zero => consts::G_ZERO,
 			GasCost::Base => consts::G_BASE,
@@ -686,11 +818,57 @@ impl<'config> Inner<'config> {
 			GasCost::Low => consts::G_LOW,
 			GasCost::Invalid => return Err(ExitError::OutOfGas),
 
-			GasCost::ExtCodeSize => self.config.gas_ext_code,
-			GasCost::Balance => self.config.gas_balance,
+			GasCost::ExtCodeSize { address } =>
+				costs::address_access_cost(self.check_and_update_address_cold(address), self.config.gas_ext_code, self.config),
+			GasCost::ExtCodeCopy { address, len } =>
+				costs::extcodecopy_cost(len, self.check_and_update_address_cold(address), self.config)?,
+			GasCost::Balance { address } =>
+				costs::address_access_cost(self.check_and_update_address_cold(address), self.config.gas_balance, self.config),
 			GasCost::BlockHash => consts::G_BLOCKHASH,
-			GasCost::ExtCodeHash => self.config.gas_ext_code_hash,
+			GasCost::ExtCodeHash { address } =>
+				costs::address_access_cost(self.check_and_update_address_cold(address), self.config.gas_ext_code_hash, self.config),
 		})
+	}
+
+	fn check_and_update_address_cold(&mut self, address: H160) -> bool {
+		let is_cold = self.is_address_cold(&address);
+		if is_cold {
+			self.accessed_addresses.as_mut().map(|set| set.insert(address));
+		}
+		is_cold
+	}
+
+	fn check_and_update_storage_cold(&mut self, address: H160, key: H256) -> bool {
+		let tuple = (address, key);
+		let is_cold = self.is_storage_cold(&tuple);
+		if is_cold {
+			self.accessed_storage_keys.as_mut().map(|set| set.insert(tuple));
+		}
+		is_cold
+	}
+
+	fn is_address_cold(&self, address: &H160) -> bool {
+        if let Some(accessed_addresses) = &self.accessed_addresses {
+			if accessed_addresses.contains(address) {
+				false
+			} else {
+				self.parent.as_ref().map(|p| p.is_address_cold(address)).unwrap_or(true)
+			}
+		} else {
+			false
+		}
+	}
+
+	fn is_storage_cold(&self, tuple: &(H160, H256)) -> bool {
+        if let Some(accessed_storage_keys) = &self.accessed_storage_keys {
+			if accessed_storage_keys.contains(tuple) {
+				false
+			} else {
+				self.parent.as_ref().map(|p| p.is_storage_cold(tuple)).unwrap_or(true)
+			}
+		} else {
+			false
+		}
 	}
 
 	fn gas_refund(
@@ -700,7 +878,7 @@ impl<'config> Inner<'config> {
 		match cost {
 			_ if self.config.estimate => 0,
 
-			GasCost::SStore { original, current, new } =>
+			GasCost::SStore { original, current, new, .. } =>
 				costs::sstore_refund(original, current, new, self.config),
 			GasCost::Suicide { already_removed, .. } =>
 				costs::suicide_refund(already_removed),
@@ -724,13 +902,22 @@ pub enum GasCost {
 	Invalid,
 
 	/// Gas cost for `EXTCODESIZE`.
-	ExtCodeSize,
+	ExtCodeSize {
+		/// Address to get code size of
+		address: H160,
+	},
 	/// Gas cost for `BALANCE`.
-	Balance,
+	Balance {
+		/// Address to get balance of
+		address: H160,
+	},
 	/// Gas cost for `BLOCKHASH`.
 	BlockHash,
 	/// Gas cost for `EXTBLOCKHASH`.
-	ExtCodeHash,
+	ExtCodeHash {
+		/// Address to get code hash of
+		address: H160,
+	},
 
 	/// Gas cost for `CALL`.
 	Call {
@@ -738,6 +925,8 @@ pub enum GasCost {
 		value: U256,
 		/// Call gas.
 		gas: U256,
+		/// Address to call
+		target: H160,
 		/// Whether the target exists.
 		target_exists: bool
 	},
@@ -747,6 +936,8 @@ pub enum GasCost {
 		value: U256,
 		/// Call gas.
 		gas: U256,
+		/// Address to call
+		target: H160,
 		/// Whether the target exists.
 		target_exists: bool
 	},
@@ -754,6 +945,8 @@ pub enum GasCost {
 	DelegateCall {
 		/// Call gas.
 		gas: U256,
+		/// Address to call
+		target: H160,
 		/// Whether the target exists.
 		target_exists: bool
 	},
@@ -761,6 +954,8 @@ pub enum GasCost {
 	StaticCall {
 		/// Call gas.
 		gas: U256,
+		/// Address to call
+		target: H160,
 		/// Whether the target exists.
 		target_exists: bool
 	},
@@ -768,6 +963,8 @@ pub enum GasCost {
 	Suicide {
 		/// Value.
 		value: U256,
+		/// ETH recipient
+		target: H160,
 		/// Whether the target exists.
 		target_exists: bool,
 		/// Whether the target has already been removed.
@@ -775,6 +972,10 @@ pub enum GasCost {
 	},
 	/// Gas cost for `SSTORE`.
 	SStore {
+		/// Address the storage is for
+		address: H160,
+		/// Key
+		key: H256,
 		/// Original value.
 		original: H256,
 		/// Current value.
@@ -796,6 +997,8 @@ pub enum GasCost {
 	},
 	/// Gas cost for `EXTCODECOPY`.
 	ExtCodeCopy {
+		/// Address to copy code from
+		address: H160,
 		/// Length.
 		len: U256
 	},
@@ -817,7 +1020,12 @@ pub enum GasCost {
 		len: U256
 	},
 	/// Gas cost for `SLOAD`.
-	SLoad,
+	SLoad {
+		/// Address the storage is for
+		address: H160,
+		/// Key to read
+		key: H256,
+	},
 }
 
 /// Memory cost.
@@ -837,14 +1045,22 @@ pub enum TransactionCost {
 		/// Length of zeros in transaction data.
 		zero_data_len: usize,
 		/// Length of non-zeros in transaction data.
-		non_zero_data_len: usize
+		non_zero_data_len: usize,
+		/// Number of addresses in transaction access list (see EIP-2930)
+		access_list_address_len: usize,
+		/// Total number of storage keys in transaction access list (see EIP-2930)
+		access_list_storage_len: usize,
 	},
 	/// Create transaction cost.
 	Create {
 		/// Length of zeros in transaction data.
 		zero_data_len: usize,
 		/// Length of non-zeros in transaction data.
-		non_zero_data_len: usize
+		non_zero_data_len: usize,
+		/// Number of addresses in transaction access list (see EIP-2930)
+		access_list_address_len: usize,
+		/// Total number of storage keys in transaction access list (see EIP-2930)
+		access_list_storage_len: usize,
 	},
 }
 
